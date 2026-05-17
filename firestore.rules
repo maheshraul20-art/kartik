@@ -1,0 +1,98 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() { return request.auth != null; }
+    function role()       { return request.auth.token.role; }
+    function mySociety()  { return request.auth.token.societyId; }
+    function myFlat()     { return request.auth.token.flatId; }
+    function isSuper()    { return isSignedIn() && role() == 'SUPER_ADMIN'; }
+    function isSocietyAdmin(sid) {
+      return isSignedIn() && role() == 'SOCIETY_ADMIN' && mySociety() == sid;
+    }
+    function isResidentOf(sid) {
+      return isSignedIn() && role() in ['RESIDENT_OWNER','RESIDENT_TENANT'] && mySociety() == sid;
+    }
+    function isGuardOf(sid) {
+      return isSignedIn() && role() == 'SECURITY_GUARD' && mySociety() == sid;
+    }
+    function isMemberOf(sid) {
+      return isSocietyAdmin(sid) || isResidentOf(sid) || isGuardOf(sid);
+    }
+
+    match /superAdmins/{uid}        { allow read, write: if isSuper(); }
+    match /plans/{planId}           { allow read: if isSignedIn(); allow write: if isSuper(); }
+
+    match /users/{uid} {
+      allow read: if isSignedIn() && (request.auth.uid == uid || isSuper());
+      allow create: if request.auth.uid == uid;
+      allow update: if request.auth.uid == uid
+                    && !('memberships' in request.resource.data.diff(resource.data).affectedKeys());
+    }
+
+    match /societies/{sid} {
+      allow read:   if isSuper() || isMemberOf(sid);
+      allow create: if isSuper();
+      allow update: if isSuper() || isSocietyAdmin(sid);
+      allow delete: if isSuper();
+
+      match /flats/{flatId} {
+        allow read:  if isSuper() || isMemberOf(sid);
+        allow write: if isSuper() || isSocietyAdmin(sid);
+      }
+
+      match /residents/{rid} {
+        allow read:  if isSuper() || isSocietyAdmin(sid)
+                     || (isResidentOf(sid) && request.auth.uid == rid);
+        allow write: if isSuper() || isSocietyAdmin(sid);
+      }
+
+      match /invoices/{iid} {
+        allow read: if isSuper() || isSocietyAdmin(sid)
+                    || (isResidentOf(sid) && resource.data.residentUid == request.auth.uid);
+        allow create, update: if isSocietyAdmin(sid);
+        // Payment confirmations happen via Cloud Function (admin SDK) only
+      }
+
+      match /complaints/{cid} {
+        allow read: if isSocietyAdmin(sid)
+                    || (isResidentOf(sid) && resource.data.residentUid == request.auth.uid);
+        allow create: if isResidentOf(sid)
+                      && request.resource.data.residentUid == request.auth.uid;
+        allow update: if isSocietyAdmin(sid);
+      }
+
+      match /notices/{nid} {
+        allow read:  if isMemberOf(sid);
+        allow write: if isSocietyAdmin(sid);
+      }
+
+      match /visitors/{vid} {
+        allow read: if isSocietyAdmin(sid) || isGuardOf(sid)
+                    || (isResidentOf(sid) && resource.data.flatId == myFlat());
+        allow create: if isGuardOf(sid) || isSocietyAdmin(sid);
+        allow update: if isGuardOf(sid) || isSocietyAdmin(sid)
+                      || (isResidentOf(sid)
+                          && resource.data.flatId == myFlat()
+                          && request.resource.data.diff(resource.data).affectedKeys()
+                              .hasOnly(['approvalStatus']));
+      }
+
+      match /staff/{x}     { allow read, write: if isSocietyAdmin(sid); }
+      match /vendors/{x}   { allow read, write: if isSocietyAdmin(sid); }
+      match /documents/{x} { allow read: if isMemberOf(sid); allow write: if isSocietyAdmin(sid); }
+    }
+
+    match /subscriptions/{id} {
+      allow read: if isSuper() || isSocietyAdmin(resource.data.societyId);
+      allow write: if false; // Cloud Function only
+    }
+
+    match /supportTickets/{id} {
+      allow read, write: if isSuper()
+                          || (isSocietyAdmin(resource.data.societyId)
+                              && request.auth.uid == resource.data.raisedBy);
+      allow create: if isSocietyAdmin(request.resource.data.societyId);
+    }
+  }
+}
